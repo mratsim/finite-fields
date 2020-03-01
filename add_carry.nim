@@ -11,12 +11,20 @@ type
 
 func addcarry_u64(carryIn: Carry, a, b: uint64, sum: var uint64): Carry {.importc: "_addcarry_u64", header:"<x86intrin.h>", nodecl.}
 
-func `+=`(a: var BigInt, b: BigInt) =
+func add_intrinsics(a: var BigInt, b: BigInt) =
   var carry: Carry
   for i in 0 ..< a.limbs.len:
     carry = addcarry_u64(carry, a.limbs[i], b.limbs[i], a.limbs[i])
 
-func add256(a: var BigInt, b: BigInt) =
+func `+=`(a: var BigInt, b: BigInt) {.noinline.}=
+  # no-inline needed otherwise the compiler multiplies
+  # by the number of iterations in the benchmark
+  var carry: bool
+  for i in 0 ..< a.limbs.len:
+    a.limbs[i] += b.limbs[i] + uint64(carry)
+    carry = a.limbs[i] < b.limbs[i]
+
+func add256_asm(a: var BigInt, b: BigInt) =
   var tmp: uint64
 
   asm """
@@ -54,11 +62,15 @@ proc main() =
 
   var a1 = a
   a1 += b
-  echo "compiler: ", a1
+  echo "pure: ", a1
 
   var a2 = a
-  a2.add256(b)
+  a2.add256_asm(b)
   echo "assembly: ",a2
+
+  var a3 = a
+  a3.add_intrinsics(b)
+  echo "intrinsics: ",a2
 
 main()
 
@@ -66,7 +78,7 @@ echo "\n⚠️ Measurements are approximate and use the CPU nominal clock: Turbo
 echo "==========================================================================================================\n"
 
 proc report(op, impl: string, start, stop: MonoTime, startClk, stopClk: int64, iters: int) =
-  echo &"{op:<15} {impl:<15} {inNanoseconds((stop-start) div iters):>9} ns {(stopClk - startClk) div iters:>9} cycles"
+  echo &"{op:<15} {impl:<25} {inNanoseconds((stop-start) div iters):>9} ns {(stopClk - startClk) div iters:>9} cycles"
 
 
 proc bench() =
@@ -84,7 +96,7 @@ proc bench() =
       a1 += b
     let stopClk = getTicks()
     let stop = getMonotime()
-    report("Addition - 256-bit", "Compiler", start, stop, startClk, stopClk, Iters)
+    report("Addition - 256-bit", "Pure Nim", start, stop, startClk, stopClk, Iters)
 
   block:
     var a2 = a
@@ -92,39 +104,51 @@ proc bench() =
     let start = getMonotime()
     let startClk = getTicks()
     for _ in 0 ..< Iters:
-      a2.add256(b)
+      a2.add256_asm(b)
     let stopClk = getTicks()
     let stop = getMonotime()
     report("Addition - 256-bit", "Assembly", start, stop, startClk, stopClk, Iters)
+
+  block:
+    var a2 = a
+
+    let start = getMonotime()
+    let startClk = getTicks()
+    for _ in 0 ..< Iters:
+      a2.add_intrinsics(b)
+    let stopClk = getTicks()
+    let stop = getMonotime()
+    report("Addition - 256-bit", "Intrinsics", start, stop, startClk, stopClk, Iters)
+
 
 bench()
 
 # ######################################################
 # Codegen (GCC?):
-# https://godbolt.org/z/z3pdUz
+# https://gcc.godbolt.org/z/jaS9kE
 #
 # GNU syntax (result on the right)
 #
-# pluseq___lAkqysv83DgJrUCC9aFJqPw:
-#  mov (%rdi),%rax
-#  add (%rsi),%rax
-#  setb %dl
-#  mov %rax,(%rdi)
-#  mov 0x8(%rdi),%rax
-#  add $0xff,%dl
-#  adc 0x8(%rsi),%rax
-#  setb %dl
-#  mov %rax,0x8(%rdi)
-#  mov 0x10(%rdi),%rax
-#  add $0xff,%dl
-#  adc 0x10(%rsi),%rax
-#  setb %dl
-#  mov %rax,0x10(%rdi)
-#  mov 0x18(%rsi),%rax
-#  add $0xff,%dl
-#  adc %rax,0x18(%rdi)
+# add_intrinsics__lAkqysv83DgJrUCC9aFJqPw_2:
+#  mov    (%rdi),%rax
+#  add    (%rsi),%rax
+#  setb   %dl
+#  mov    %rax,(%rdi)
+#  mov    0x8(%rdi),%rax
+#  add    $0xff,%dl
+#  adc    0x8(%rsi),%rax
+#  setb   %dl
+#  mov    %rax,0x8(%rdi)
+#  mov    0x10(%rdi),%rax
+#  add    $0xff,%dl
+#  adc    0x10(%rsi),%rax
+#  setb   %dl
+#  mov    %rax,0x10(%rdi)
+#  mov    0x18(%rsi),%rax
+#  add    $0xff,%dl
+#  adc    %rax,0x18(%rdi)
 #  retq
-#  nopl 0x0(%rax)
+#  nopl   0x0(%rax)
 #
 # Analysis: this is extremely bad
 # After the first add, it saves the content of
@@ -133,17 +157,44 @@ bench()
 # to recreate the carry flag
 # then adc
 #
-# A better ASM would be (a is in rdi and b in rsi)
-# pluseq___lAkqysv83DgJrUCC9aFJqPw:
-#  mov (%rdi),%rax
-#  add %rax, (%rsi)
-#  mov 0x8(%rdi),%rax
-#  adc %rax, 0x8(%rsi)
-#  mov 0x16(%rdi),%rax
-#  adc %rax, 0x16(%rsi)
-#  mov 0x24(%rsi),%rax
-#  adc %rax,0x24(%rdi)
+# pluseq___n9b4WZZ5kS9bf0NOqjX9cV9bxQ:
+#  mov    (%rdi),%rax
+#  add    (%rsi),%rax
+#  mov    %rax,(%rdi)
+#  cmp    (%rsi),%rax
+#  mov    0x8(%rsi),%rdx
+#  adc    0x8(%rdi),%rdx
+#  mov    %rdx,0x8(%rdi)
+#  cmp    0x8(%rsi),%rdx
+#  mov    0x10(%rsi),%rax
+#  adc    0x10(%rdi),%rax
+#  mov    %rax,0x10(%rdi)
+#  cmp    0x10(%rsi),%rax
+#  mov    0x18(%rsi),%rdx
+#  adc    %rdx,0x18(%rdi)
 #  retq
+#  nop
+#  nopw   %cs:0x0(%rax,%rax,1)
+#
+# Analysis: This is better than using the intrinsics but
+# we have an extra useless cmp every limbs which means 33% slowdown
+# as due to the instruction dependency, the processor cannot use instruction-level parallelism
+#
+# add256_asm__lAkqysv83DgJrUCC9aFJqPw:
+#  xor    %eax,%eax
+#  mov    (%rsi),%rax
+#  add    %rax,(%rdi)
+#  mov    0x8(%rsi),%rax
+#  adc    %rax,0x8(%rdi)
+#  mov    0x10(%rsi),%rax
+#  adc    %rax,0x10(%rdi)
+#  mov    0x18(%rsi),%rax
+#  adc    %rax,0x18(%rdi)
+#  retq
+#  nopl   0x0(%rax,%rax,1)
+#  nopw   %cs:0x0(%rax,%rax,1)
+#
+# Analysis: this is the ideal assembly that we would like from an optimizing compiler
 #
 # Caveat: ADC with a memory destination (instead of register) is much slower
 #         on Intel (not AMD) especially before Skylake
