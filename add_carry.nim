@@ -9,9 +9,11 @@ type
 
   Carry = cuchar
 
+  uint128 {.importc: "unsigned __int128".} = object
+
 func addcarry_u64(carryIn: Carry, a, b: uint64, sum: var uint64): Carry {.importc: "_addcarry_u64", header:"<x86intrin.h>", nodecl.}
 
-func add_intrinsics(a: var BigInt, b: BigInt) =
+func add_intrinsics(a: var BigInt, b: BigInt) {.noinline.}=
   var carry: Carry
   for i in 0 ..< a.limbs.len:
     carry = addcarry_u64(carry, a.limbs[i], b.limbs[i], a.limbs[i])
@@ -24,7 +26,15 @@ func `+=`(a: var BigInt, b: BigInt) {.noinline.}=
     a.limbs[i] += b.limbs[i] + uint64(carry)
     carry = a.limbs[i] < b.limbs[i]
 
-func add256_asm(a: var BigInt, b: BigInt) =
+func add_via_u128(a: var BigInt, b: BigInt) {.noinline.}=
+  var tmp {.noinit.}: uint128
+  {.emit:[tmp, " = (unsigned __int128)0;"].}
+  for i in 0 ..< a.limbs.len:
+    {.emit:[tmp, " += (unsigned __int128)", a.limbs[i], " + (unsigned __int128)", b.limbs[i], ";"].}
+    {.emit:[a.limbs[i], " = (NU64)", tmp, ";"].}
+    {.emit:[tmp, " >>= 64;"].}
+
+func add256_asm(a: var BigInt, b: BigInt) {.noinline.}=
   var tmp: uint64
 
   asm """
@@ -72,6 +82,10 @@ proc main() =
   a3.add_intrinsics(b)
   echo "intrinsics: ",a2
 
+  var a4 = a
+  a4.add_via_u128(b)
+  echo "via u128: ",a4
+
 main()
 
 echo "\n⚠️ Measurements are approximate and use the CPU nominal clock: Turbo-Boost and overclocking will skew them."
@@ -110,22 +124,32 @@ proc bench() =
     report("Addition - 256-bit", "Assembly", start, stop, startClk, stopClk, Iters)
 
   block:
-    var a2 = a
+    var a3 = a
 
     let start = getMonotime()
     let startClk = getTicks()
     for _ in 0 ..< Iters:
-      a2.add_intrinsics(b)
+      a3.add_intrinsics(b)
     let stopClk = getTicks()
     let stop = getMonotime()
     report("Addition - 256-bit", "Intrinsics", start, stop, startClk, stopClk, Iters)
 
+  block:
+    var a4 = a
+
+    let start = getMonotime()
+    let startClk = getTicks()
+    for _ in 0 ..< Iters:
+      a4.add_via_u128(b)
+    let stopClk = getTicks()
+    let stop = getMonotime()
+    report("Addition - 256-bit", "via uint128", start, stop, startClk, stopClk, Iters)
 
 bench()
 
 # ######################################################
 # Codegen (GCC?):
-# https://gcc.godbolt.org/z/jaS9kE
+# https://gcc.godbolt.org/z/mFvYA8
 #
 # GNU syntax (result on the right)
 #
@@ -156,6 +180,58 @@ bench()
 # then store the result, then add the content of %dl to 0xff
 # to recreate the carry flag
 # then adc
+#
+#
+# add_via_u128__lAkqysv83DgJrUCC9aFJqPw_3:
+#  mov    (%rsi),%rcx
+#  mov    (%rdi),%r8
+#  xor    %edx,%edx
+#  push   %r12
+#  mov    0x8(%rdi),%r9
+#  push   %rbx
+#  xor    %ebx,%ebx
+#  lea    (%rcx,%r8,1),%rax
+#  mov    %rax,(%rdi)
+#  mov    %rcx,%rax
+#  mov    %r8,%rcx
+#  add    %rax,%rcx
+#  mov    0x8(%rsi),%rax
+#  adc    %rdx,%rbx
+#  xor    %r10d,%r10d
+#  xor    %edx,%edx
+#  mov    %rbx,%rcx
+#  xor    %ebx,%ebx
+#  add    %r9,%rax
+#  adc    %r10,%rdx
+#  add    %rcx,%rax
+#  adc    %rbx,%rdx
+#  mov    %rax,0x8(%rdi)
+#  mov    0x10(%rsi),%rcx
+#  mov    %rdx,%rax
+#  xor    %edx,%edx
+#  xor    %ebx,%ebx
+#  mov    %rax,%r9
+#  mov    0x10(%rdi),%rax
+#  mov    %rdx,%r10
+#  xor    %edx,%edx
+#  add    %rcx,%rax
+#  adc    %rbx,%rdx
+#  add    %r9,%rax
+#  mov    0x18(%rdi),%r9
+#  mov    %rax,0x10(%rdi)
+#  mov    0x18(%rsi),%rcx
+#  adc    %r10,%rdx
+#  mov    %rdx,%rax
+#  pop    %rbx
+#  add    %rcx,%r9
+#  add    %r9,%rax
+#  mov    %rax,0x18(%rdi)
+#  pop    %r12
+#  retq
+#  nopl   0x0(%rax)
+#  nopw   %cs:0x0(%rax,%rax,1)
+#
+# Analysis: no comment ...
 #
 # pluseq___n9b4WZZ5kS9bf0NOqjX9cV9bxQ:
 #  mov    (%rdi),%rax
