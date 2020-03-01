@@ -34,7 +34,13 @@ func add_via_u128(a: var BigInt, b: BigInt) {.noinline.}=
     {.emit:[a.limbs[i], " = (NU64)", tmp, ";"].}
     {.emit:[tmp, " >>= 64;"].}
 
-func add256_asm(a: var BigInt, b: BigInt) {.noinline.}=
+func add256_pure(a: var BigInt[256], b: BigInt[256]) {.noinline.}=
+  a.limbs[0] += b.limbs[0]
+  a.limbs[1] += b.limbs[1] + uint64(a.limbs[0] < b.limbs[0])
+  a.limbs[2] += b.limbs[2] + uint64(a.limbs[1] < b.limbs[1])
+  a.limbs[3] += b.limbs[3] + uint64(a.limbs[2] < b.limbs[2])
+
+func add256_asm(a: var BigInt[256], b: BigInt[256]) {.noinline.}=
   var tmp: uint64
 
   asm """
@@ -80,13 +86,33 @@ proc main() =
 
   var a3 = a
   a3.add_intrinsics(b)
-  echo "intrinsics: ",a2
+  echo "intrinsics: ",a3
 
   var a4 = a
   a4.add_via_u128(b)
   echo "via u128: ",a4
 
+  var a5 = a
+  a5.add256_pure(b)
+  echo "unrolled pure Nim: ",a5
+
 main()
+
+# warmup
+proc warmup*() =
+  # Warmup - make sure cpu is on max perf
+  let start = cpuTime()
+  var foo = 123
+  for i in 0 ..< 300_000_000:
+    foo += i*i mod 456
+    foo = foo mod 789
+
+  # Compiler shouldn't optimize away the results as cpuTime rely on sideeffects
+  let stop = cpuTime()
+  echo &"Warmup: {stop - start:>4.4f} s, result {foo} (displayed to avoid compiler optimizing warmup away)"
+
+warmup()
+
 
 echo "\n⚠️ Measurements are approximate and use the CPU nominal clock: Turbo-Boost and overclocking will skew them."
 echo "==========================================================================================================\n"
@@ -144,6 +170,17 @@ proc bench() =
     let stopClk = getTicks()
     let stop = getMonotime()
     report("Addition - 256-bit", "via uint128", start, stop, startClk, stopClk, Iters)
+
+  block:
+    var a5 = a
+
+    let start = getMonotime()
+    let startClk = getTicks()
+    for _ in 0 ..< Iters:
+      a5.add256_pure(b)
+    let stopClk = getTicks()
+    let stop = getMonotime()
+    report("Addition - 256-bit", "unrolled", start, stop, startClk, stopClk, Iters)
 
 bench()
 
