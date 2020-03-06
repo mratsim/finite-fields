@@ -38,7 +38,7 @@ func add_excess(a: var BigIntExcessBits, b: BigIntExcessBits) {.noinline.}=
   var excess = 0'u64
   for i in 0 ..< a.limbs.len:
     a.limbs[i] += b.limbs[i] + excess
-    excess = a.limbs[i].isMsbSet
+    excess = a.limbs[i].isMsbSet # This is only valid because we have only one 1 excess bit
     a.limbs[i] = a.limbs[i].mask()
 
 # ###############################################################################
