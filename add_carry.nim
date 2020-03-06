@@ -40,25 +40,25 @@ func add256_pure(a: var BigInt[256], b: BigInt[256]) {.noinline.}=
   a.limbs[2] += b.limbs[2] + uint64(a.limbs[1] < b.limbs[1])
   a.limbs[3] += b.limbs[3] + uint64(a.limbs[2] < b.limbs[2])
 
-func add256_asm(a: var BigInt[256], b: BigInt[256]) {.noinline.}=
-  var tmp: uint64
+# func add256_asm(a: var BigInt[256], b: BigInt[256]) {.noinline.}=
+#   var tmp: uint64
 
-  asm """
-    movq %[b], %[tmp]
-    addq %[tmp], %[a]
+#   asm """
+#     movq %[b], %[tmp]
+#     addq %[tmp], %[a]
 
-    movq 8+%[b], %[tmp]
-    adcq %[tmp], 8+%[a]
+#     movq 8+%[b], %[tmp]
+#     adcq %[tmp], 8+%[a]
 
-    movq 16+%[b], %[tmp]
-    adcq %[tmp], 16+%[a]
+#     movq 16+%[b], %[tmp]
+#     adcq %[tmp], 16+%[a]
 
-    movq 24+%[b], %[tmp]
-    adcq %[tmp], 24+%[a]
-    : [tmp] "+r" (`tmp`), [a] "+m" (`a->limbs[0]`)
-    : [b] "m"(`b->limbs[0]`)
-    : "cc"
-  """
+#     movq 24+%[b], %[tmp]
+#     adcq %[tmp], 24+%[a]
+#     : [tmp] "+r" (`tmp`), [a] "+m" (`a->limbs[0]`)
+#     : [b] "m"(`b->limbs[0]`)
+#     : "cc"
+#   """
 
 # ######################################################
 import random, times, std/monotimes, strformat
@@ -80,9 +80,9 @@ proc main() =
   a1 += b
   echo "pure: ", a1
 
-  var a2 = a
-  a2.add256_asm(b)
-  echo "assembly: ",a2
+  # var a2 = a
+  # a2.add256_asm(b)
+  # echo "assembly: ",a2
 
   var a3 = a
   a3.add_intrinsics(b)
@@ -138,16 +138,16 @@ proc bench() =
     let stop = getMonotime()
     report("Addition - 256-bit", "Pure Nim", start, stop, startClk, stopClk, Iters)
 
-  block:
-    var a2 = a
+  # block:
+  #   var a2 = a
 
-    let start = getMonotime()
-    let startClk = getTicks()
-    for _ in 0 ..< Iters:
-      a2.add256_asm(b)
-    let stopClk = getTicks()
-    let stop = getMonotime()
-    report("Addition - 256-bit", "Assembly", start, stop, startClk, stopClk, Iters)
+  #   let start = getMonotime()
+  #   let startClk = getTicks()
+  #   for _ in 0 ..< Iters:
+  #     a2.add256_asm(b)
+  #   let stopClk = getTicks()
+  #   let stop = getMonotime()
+  #   report("Addition - 256-bit", "Assembly", start, stop, startClk, stopClk, Iters)
 
   block:
     var a3 = a
