@@ -23,6 +23,9 @@ type
 # ###############################################################################
 # Constant time conditional move
 
+# Note changing the register constraint "r to memory "rm" or any "g"
+# leads to slightly higher cycle count
+
 func mux*[T](ctl: T, x, y: T): T {.inline.}=
   ## Multiplexer / selector
   ## Returns x if ctl is true
@@ -136,7 +139,7 @@ func conditionalSub(a: var BigIntCarry, b: BigIntCarry, ctl: uint64) =
   #       and there is no ADOX equivalent for SBB that would only use the OF flag
   for i in 0 ..< a.limbs.len:
     borrow = subborrow_u64(borrow, a.limbs[i], b.limbs[i], diff)
-    a.limbs[i] = ctl.mux(diff, a.limbs[i])
+    ctl.ccopy(a.limbs[i], diff)
 
 func addmod(a: var BigIntCarry, b: BigIntCarry, modulus: BigIntCarry) {.noinline.}=
   var overflowed = uint64 a.add_intrinsics(b)
