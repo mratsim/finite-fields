@@ -4,6 +4,8 @@ func wordsRequired(bits: int): int {.compileTime.} =
   (bits + 64 - 1) div 64
 
 type
+  # Note: a custom bycopy type for limbs is probably
+  #       useful for optimization in particular for aliasing.
   BigInt[bits: static int] = object
     limbs: array[bits.wordsRequired, uint64]
 
@@ -11,7 +13,21 @@ type
 
   uint128 {.importc: "unsigned __int128".} = object
 
+  CarryFlag = enum
+    cfFalse
+    cfTrue
+
+# #######################################################
+
 func addcarry_u64(carryIn: Carry, a, b: uint64, sum: var uint64): Carry {.importc: "_addcarry_u64", header:"<x86intrin.h>", nodecl.}
+
+func addcarry_via128(sum: var uint64, carryOut: var CarryFlag, carryIn: CarryFlag, a, b: uint64) =
+  var tmp {.noinit.}: uint128
+  {.emit: [tmp, " = (unsigned __int128)", carryIn, " + (unsigned __int128)",a," + (unsigned __int128)",b,";"].}
+  {.emit: ["*",sum, " = (NU64)(", tmp, "& (NU64)0xffffffffffffffff);"].}
+  {.emit: ["*",carryOut, " = (",CarryFlag,")((", tmp, ">> 64) & 1);"].}
+
+# #######################################################
 
 func add_intrinsics(a: var BigInt, b: BigInt) {.noinline.}=
   var carry: Carry
@@ -34,31 +50,67 @@ func add_via_u128(a: var BigInt, b: BigInt) {.noinline.}=
     {.emit:[a.limbs[i], " = (NU64)", tmp, ";"].}
     {.emit:[tmp, " >>= 64;"].}
 
+func add_via_addcarry128(a: var BigInt, b: BigInt) {.noinline.}=
+  var carry: CarryFlag
+  for i in 0 ..< a.limbs.len:
+    addcarry_via128(a.limbs[i], carry, carry, a.limbs[i], b.limbs[i])
+
 func add256_pure(a: var BigInt[256], b: BigInt[256]) {.noinline.}=
   a.limbs[0] += b.limbs[0]
   a.limbs[1] += b.limbs[1] + uint64(a.limbs[0] < b.limbs[0])
   a.limbs[2] += b.limbs[2] + uint64(a.limbs[1] < b.limbs[1])
   a.limbs[3] += b.limbs[3] + uint64(a.limbs[2] < b.limbs[2])
 
-# func add256_asm(a: var BigInt[256], b: BigInt[256]) {.noinline.}=
-#   var tmp: uint64
+func add256_pure2(a: var BigInt[256], b: BigInt[256]) {.noinline.}=
+  a.limbs[0] += b.limbs[0]
+  a.limbs[1] += uint64(a.limbs[0] < b.limbs[0])
+  a.limbs[1] += b.limbs[1]
+  a.limbs[2] += uint64(a.limbs[1] < b.limbs[1])
+  a.limbs[2] += b.limbs[2]
+  a.limbs[3] += uint64(a.limbs[2] < b.limbs[2])
+  a.limbs[3] += b.limbs[3]
 
-#   asm """
-#     movq %[b], %[tmp]
-#     addq %[tmp], %[a]
+func add256_asm(a: var BigInt[256], b: BigInt[256]) {.noinline.}=
+  var tmp: uint64
 
-#     movq 8+%[b], %[tmp]
-#     adcq %[tmp], 8+%[a]
+  when defined(gcc):
+    asm """
+      movq 0+%[b], %[tmp]
+      addq %[tmp], 0+%[a]
 
-#     movq 16+%[b], %[tmp]
-#     adcq %[tmp], 16+%[a]
+      movq 8+%[b], %[tmp]
+      adcq %[tmp], 8+%[a]
 
-#     movq 24+%[b], %[tmp]
-#     adcq %[tmp], 24+%[a]
-#     : [tmp] "+r" (`tmp`), [a] "+m" (`a->limbs[0]`)
-#     : [b] "m"(`b->limbs[0]`)
-#     : "cc"
-#   """
+      movq 16+%[b], %[tmp]
+      adcq %[tmp], 16+%[a]
+
+      movq 24+%[b], %[tmp]
+      adcq %[tmp], 24+%[a]
+      : [tmp] "+r" (`tmp`), [a] "=&m" (`a->limbs[0]`)
+      : [b] "m"(`b->limbs[0]`)
+      : "cc"
+    """
+  elif defined(clang):
+    # https://lists.llvm.org/pipermail/llvm-dev/2017-August/116202.html
+    # Remove the 0 from 8+0 when the proc is inline ....
+    asm """
+      movq 0+0%[b], %[tmp]
+      addq %[tmp], 0+0%[a]
+
+      movq 8+0%[b], %[tmp]
+      adcq %[tmp], 8+0%[a]
+
+      movq 16+0%[b], %[tmp]
+      adcq %[tmp], 16+0%[a]
+
+      movq 24+0%[b], %[tmp]
+      adcq %[tmp], 24+0%[a]
+      : [tmp] "+r" (`tmp`), [a] "=&m" (`a->limbs[0]`)
+      : [b] "m"(`b->limbs[0]`)
+      : "cc"
+    """
+  else:
+    {.error: "Unsupported compiler".}
 
 # ######################################################
 import random, times, std/monotimes, strformat
@@ -80,9 +132,9 @@ proc main() =
   a1 += b
   echo "pure: ", a1
 
-  # var a2 = a
-  # a2.add256_asm(b)
-  # echo "assembly: ",a2
+  var a2 = a
+  a2.add256_asm(b)
+  echo "assembly: ",a2
 
   var a3 = a
   a3.add_intrinsics(b)
@@ -95,6 +147,14 @@ proc main() =
   var a5 = a
   a5.add256_pure(b)
   echo "unrolled pure Nim: ",a5
+
+  var a6 = a
+  a6.add256_pure2(b)
+  echo "unrolled pure Nim v2: ",a6
+
+  var a7 = a
+  a7.add_via_addcarry128(b)
+  echo "addcarry128: ",a7
 
 main()
 
@@ -138,16 +198,16 @@ proc bench() =
     let stop = getMonotime()
     report("Addition - 256-bit", "Pure Nim", start, stop, startClk, stopClk, Iters)
 
-  # block:
-  #   var a2 = a
+  block:
+    var a2 = a
 
-  #   let start = getMonotime()
-  #   let startClk = getTicks()
-  #   for _ in 0 ..< Iters:
-  #     a2.add256_asm(b)
-  #   let stopClk = getTicks()
-  #   let stop = getMonotime()
-  #   report("Addition - 256-bit", "Assembly", start, stop, startClk, stopClk, Iters)
+    let start = getMonotime()
+    let startClk = getTicks()
+    for _ in 0 ..< Iters:
+      a2.add256_asm(b)
+    let stopClk = getTicks()
+    let stop = getMonotime()
+    report("Addition - 256-bit", "Assembly", start, stop, startClk, stopClk, Iters)
 
   block:
     var a3 = a
@@ -181,6 +241,28 @@ proc bench() =
     let stopClk = getTicks()
     let stop = getMonotime()
     report("Addition - 256-bit", "unrolled", start, stop, startClk, stopClk, Iters)
+
+  block:
+    var a6 = a
+
+    let start = getMonotime()
+    let startClk = getTicks()
+    for _ in 0 ..< Iters:
+      a6.add256_pure2(b)
+    let stopClk = getTicks()
+    let stop = getMonotime()
+    report("Addition - 256-bit", "unrolled v2", start, stop, startClk, stopClk, Iters)
+
+  block:
+    var a7 = a
+
+    let start = getMonotime()
+    let startClk = getTicks()
+    for _ in 0 ..< Iters:
+      a7.add_via_addcarry128(b)
+    let stopClk = getTicks()
+    let stop = getMonotime()
+    report("Addition - 256-bit", "add_via_addcarry128", start, stop, startClk, stopClk, Iters)
 
 bench()
 

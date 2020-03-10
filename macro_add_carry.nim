@@ -21,14 +21,25 @@ macro addCarryGen_u64(a, b: untyped, bits: static int): untyped =
   let maxByteOffset = bits div 8
   const wsize = sizeof(uint64)
 
-  for byteOffset in countup(wsize, maxByteOffset-1, wsize):
-    asmStmt.add (block:
-      "\n" &
-      # movq 8+%[b], %[tmp]
-      "      movq " & $byteOffset & "+%[b], %[tmp]\n" &
-      # adcq %[tmp], 8+%[a]
-      "      adcq %[tmp], " & $byteOffset & "+%[a]\n"
-    )
+  when defined(gcc):
+    for byteOffset in countup(wsize, maxByteOffset-1, wsize):
+      asmStmt.add (block:
+        "\n" &
+        # movq 8+%[b], %[tmp]
+        "      movq " & $byteOffset & "+%[b], %[tmp]\n" &
+        # adcq %[tmp], 8+%[a]
+        "      adcq %[tmp], " & $byteOffset & "+%[a]\n"
+      )
+  elif defined(clang):
+    # https://lists.llvm.org/pipermail/llvm-dev/2017-August/116202.html
+    for byteOffset in countup(wsize, maxByteOffset-1, wsize):
+      asmStmt.add (block:
+        "\n" &
+        # movq 8+%[b], %[tmp]
+        "      movq " & $byteOffset & "%[b], %[tmp]\n" &
+        # adcq %[tmp], 8+%[a]
+        "      adcq %[tmp], " & $byteOffset & "%[a]\n"
+      )
 
   let tmp = ident("tmp")
   asmStmt.add (block:
@@ -48,7 +59,10 @@ macro addCarryGen_u64(a, b: untyped, bits: static int): untyped =
 
   echo result.toStrLit
 
-func `+=`(a: var BigInt, b: BigInt) =
+func `+=`(a: var BigInt, b: BigInt) {.noinline.}=
+  # Depending on inline or noinline
+  # the generated ASM addressing must be tweaked for Clang
+  # https://lists.llvm.org/pipermail/llvm-dev/2017-August/116202.html
   addCarryGen_u64(a, b, BigInt.bits)
 
 # #############################################
