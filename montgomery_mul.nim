@@ -1,6 +1,8 @@
 # Constant-time modular arithmetic with carry test
 # Compile with Clang, GCC is really bad
 
+import macros
+
 func wordsRequired(totalBits, bitsPerWords: int): int {.compileTime.} =
   ## Compute the number of limbs required
   # from the **announced** bit length
@@ -196,9 +198,9 @@ func negInvModWord(M: BigIntCarry): uint64 =
     M0 = M.limbs[0]
     k = fastLog2(64)
 
-  result = M0                 # Start from an inverse of M0 modulo 2, M0 is odd and it's own inverse
-  for _ in 0 ..< k:           # at each iteration we get the inverse mod(2^2k)
-    result *= 2 + M0 * result # x' = x(2 + ax) (`+` to avoid negating at the end)
+  result = M0                     # Start from an inverse of M0 modulo 2, M0 is odd and it's own inverse
+  for _ in 0 ..< k:               # at each iteration we get the inverse mod(2^2k)
+    result *= 2'u64 + M0 * result # x' = x(2 + ax) (`+` to avoid negating at the end)
 
 func montyMul_CIOS_nocarry(r: var BigIntCarry, a, b, modulus: BigIntCarry, m0inv: uint64) =
   # https://hackmd.io/@zkteam/modular_multiplication
@@ -214,7 +216,7 @@ func montyMul_CIOS_nocarry(r: var BigIntCarry, a, b, modulus: BigIntCarry, m0inv
       muladd2(A, t.limbs[j], a.limbs[j], b.limbs[i], A, t.limbs[j])
       muladd2(carry, t.limbs[j-1], m, modulus.limbs[j], carry, t.limbs[j])
 
-    t.limbs[^1] = carry + A
+    t.limbs[t.limbs.len-1] = carry + A
 
   # Conditional substraction
   r = t
@@ -244,6 +246,58 @@ func montyMul_SOS(r: var BigIntCarry, a, b, modulus: BigIntCarry, m0inv: uint64)
   # Conditional substraction
 
 # ###############################################################################
+# Unrolled
+
+proc replaceNodes(ast: NimNode, what: NimNode, by: NimNode): NimNode =
+  # Replace "what" ident node by "by"
+  proc inspect(node: NimNode): NimNode =
+    case node.kind:
+    of {nnkIdent, nnkSym}:
+      if node.eqIdent(what):
+        return by
+      return node
+    of nnkEmpty:
+      return node
+    of nnkLiterals:
+      return node
+    else:
+      var rTree = node.kind.newTree()
+      for child in node:
+        rTree.add inspect(child)
+      return rTree
+  result = inspect(ast)
+
+macro staticFor(idx: untyped{nkIdent}, start, stopEx: static int, body: untyped): untyped =
+  result = newStmtList()
+  for i in start ..< stopEx:
+    result.add nnkBlockStmt.newTree(
+      ident("unrolledIter_" & $idx & $i),
+      body.replaceNodes(idx, newLit i)
+    )
+
+func montyMul_CIOS_nocarry_unrolled(r: var BigIntCarry, a, b, modulus: BigIntCarry, m0inv: uint64) {.noinline.}=
+  # https://hackmd.io/@zkteam/modular_multiplication
+  var t: BigIntCarry
+
+  # expandMacros:
+
+  staticFor i, 0, t.limbs.len:
+    var A: uint64
+    muladd1(A, t.limbs[0], a.limbs[0], b.limbs[i], t.limbs[0])
+    let m = t.limbs[0] * m0inv
+    var carry, lo: uint64
+    muladd1(carry, lo, m, modulus.limbs[0], t.limbs[0])
+
+    staticFor j, 1, t.limbs.len:
+      muladd2(A, t.limbs[j], a.limbs[j], b.limbs[i], A, t.limbs[j])
+      muladd2(carry, t.limbs[j-1], m, modulus.limbs[j], carry, t.limbs[j])
+
+    t.limbs[t.limbs.len-1] = carry + A
+
+  # Conditional substraction
+  r = t
+
+# ###############################################################################
 import random, times, std/monotimes, strformat
 import ./timers
 
@@ -267,7 +321,7 @@ echo "\n⚠️ Measurements are approximate and use the CPU nominal clock: Turbo
 echo "==========================================================================================================\n"
 
 proc report(op: string, bitsize: int, impl: string, start, stop: MonoTime, startClk, stopClk: int64, iters: int) =
-  echo &"{op:<30} - {bitsize}-bit {impl:<30} {inNanoseconds((stop-start) div iters):>9} ns {(stopClk - startClk) div iters:>9} cycles"
+  echo &"{op:<50} - {bitsize}-bit {impl:<30} {inNanoseconds((stop-start) div iters):>9} ns {(stopClk - startClk) div iters:>9} cycles"
 
 proc rand(T: typedesc): T =
   for i in 0 ..< result.limbs.len:
@@ -323,6 +377,20 @@ proc main(bitSize: static int) =
       let stopClk = getTicks()
       let stop = getMonotime()
       report("Montgomery Multiplication - SOS", bitsize, "Pure Nim", start, stop, startClk, stopClk, Iters)
+
+    block:
+      var aMonty, bMonty: BigIntCarry[bitSize]
+      aMonty.montyMul_SOS(a, one, M, m0inv)
+      bMonty.montyMul_SOS(b, one, M, m0inv)
+
+      var r: BigIntCarry[bitSize]
+      let start = getMonotime()
+      let startClk = getTicks()
+      for _ in 0 ..< Iters:
+        r.montyMul_CIOS_nocarry_unrolled(aMonty, bMonty, M, m0inv)
+      let stopClk = getTicks()
+      let stop = getMonotime()
+      report("Montgomery Multiplication - CIOS no carry unrolled", bitsize, "Pure Nim", start, stop, startClk, stopClk, Iters)
 
 
 main(254)
