@@ -1,24 +1,7 @@
 # Constant-time modular arithmetic with carry test
 # Compile with Clang, GCC is really bad
 
-func wordsRequired(totalBits, bitsPerWords: int): int {.compileTime.} =
-  ## Compute the number of limbs required
-  # from the **announced** bit length
-  (totalBits + bitsPerWords - 1) div bitsPerWords
-
-const ExcessBits = 13 # 51-bit words
-
-type
-  BigIntCarry[bits: static int] = object
-    limbs: array[wordsRequired(bits, 64), uint64]
-
-  BigIntExcessBits[bits: static int] = object
-    # Note: we implement lazy carry not just lazy reduction
-    excess: uint8
-    limbs: array[wordsRequired(bits, 64 - ExcessBits), uint64]
-
-  Carry = cuchar
-  Borrow = cuchar
+import modular_add_common, modular_add_asm
 
 # ###############################################################################
 # Constant time conditional move
@@ -83,20 +66,28 @@ func ccopy*[T](ctl: T, x: var T, y: T) {.inline.}=
   else:
     x = mux(ctl, y, x)
 
-func copyIfNotNeg[T](x: var T, y: T) {.inline.}=
-  ## Return y if the sign flag is set (from a previous substraction)
-  ## x left as is if not
+func test(flag: Carry or Borrow) {.inline.} =
+  asm """
+    testb %[flag], %[flag]
+    :
+    : [flag] "r"(`flag`)
+    : "cc"
+  """
+
+func copyIfNotZero[T](x: var T, y: T) {.inline.}=
+  ## Return y if the zero flag is not set
+  ## x left as is otherwise
   when defined(amd64) or defined(i386):
     when sizeof(T) == 8:
       asm """
-        cmovnsq %[y], %[x]
+        cmovnzq %[y], %[x]
         : [x] "+r" (`*x`)
         : [y] "r" (`y`)
         :
       """
     elif sizeof(T) == 4:
       asm """
-        cmovnsl %[y], %[x]
+        cmovnzl %[y], %[x]
         : [x] "+r" (`*x`)
         : [y] "r" (`y`)
         :
@@ -130,7 +121,7 @@ func GT(a: BigIntCarry, b: BigIntCarry): uint64 =
   result = borrow.uint64 xor 1 # boolean not
 
 func conditionalSub(a: var BigIntCarry, b: BigIntCarry, ctl: uint64) =
-  var borrow: cuchar
+  var borrow: byte
   var diff: uint64
   # Note: the codegen is probably bad due to subborrow relying on the carry flag
   #       and mux/cmov polluting the carry flag by zero-ing it
@@ -152,17 +143,26 @@ func addmod2(a: var BigIntCarry, b: BigIntCarry, modulus: BigIntCarry) {.noinlin
   # Algorithm
   # a += b
   # tmp = m - a
-  var tmp = a
-  discard add_intrinsics(tmp, b)
+  let overflow = add_intrinsics(a, b)
   # TODO we must save the carry flag here, a carry means reduction needed
-  a = tmp
-  discard sub_intrinsics(tmp, modulus)
+  var tmp = a
+  let gtModulus = sub_intrinsics(tmp, modulus)
   # The previous operation will set the sign flag if
   # a+b - m < 0
   # If the sign flag is not set we have a+b >= m
   # and must reduce, i.e. tmp contains the reduced value
+  let flag = overflow.byte or gtModulus.byte
+  test(flag)
   for i in 0 ..< a.limbs.len:
-    a.limbs[i].copyIfNotNeg(tmp.limbs[i])
+    a.limbs[i].copyIfNotZero(tmp.limbs[i])
+
+func addmod3(a: var BigIntCarry, b: BigIntCarry, modulus: BigIntCarry) {.noinline.}=
+  var overflowed = uint64 a.add_intrinsics(b)
+  # It's probably better to fuse a.GT(modulus) and conditionalSub
+  var tmp = a
+  overflowed = overflowed or a.sub_intrinsics(modulus)
+  for i in 0 ..< a.limbs.len:
+    overflowed.ccopy(a.limbs[i], tmp.limbs[i])
 
 # ###############################################################################
 import random, times, std/monotimes, strformat
@@ -188,7 +188,7 @@ echo "\n⚠️ Measurements are approximate and use the CPU nominal clock: Turbo
 echo "==========================================================================================================\n"
 
 proc report(op: string, bitsize: int, impl: string, start, stop: MonoTime, startClk, stopClk: int64, iters: int) =
-  echo &"{op:<30} - {bitsize}-bit {impl:<30} {inNanoseconds((stop-start) div iters):>9} ns {(stopClk - startClk) div iters:>9} cycles"
+  echo &"{op:<30} - {bitsize}-bit {impl:<40} {inNanoseconds((stop-start) div iters):>9} ns {(stopClk - startClk) div iters:>9} cycles"
 
 proc rand(T: typedesc): T =
   for i in 0 ..< result.limbs.len:
@@ -209,7 +209,7 @@ proc main(bitSize: static int) =
         a1.addmod(b, M)
       let stopClk = getTicks()
       let stop = getMonotime()
-      report("AddMod-Carry", bitsize, "Pure Nim", start, stop, startClk, stopClk, Iters)
+      report("AddMod-Carry", bitsize, "ccopy (test+cmov) ASM + csub", start, stop, startClk, stopClk, Iters)
 
     block:
       var a1 = a
@@ -219,7 +219,27 @@ proc main(bitSize: static int) =
         a1.addmod2(b, M)
       let stopClk = getTicks()
       let stop = getMonotime()
-      report("AddMod-Carry v2", bitsize, "Pure Nim", start, stop, startClk, stopClk, Iters)
+      report("AddMod-Carry v2", bitsize, "dangerous carry flag optim", start, stop, startClk, stopClk, Iters)
+
+    block:
+      var a1 = a
+      let start = getMonotime()
+      let startClk = getTicks()
+      for _ in 0 ..< Iters:
+        a1.addmod3(b, M)
+      let stopClk = getTicks()
+      let stop = getMonotime()
+      report("AddMod-Carry v3", bitsize, "ccopy + temp + merged csub/GreaterThan", start, stop, startClk, stopClk, Iters)
+
+    block: # comment this out for clang
+      var a1 = a
+      let start = getMonotime()
+      let startClk = getTicks()
+      for _ in 0 ..< Iters:
+        a1.addmod_asm(b, M)
+      let stopClk = getTicks()
+      let stop = getMonotime()
+      report("AddMod-Carry ASM", bitsize, "Full Inline ASM", start, stop, startClk, stopClk, Iters)
 
 main(254)
 main(381)

@@ -1,7 +1,7 @@
-# bignum
-Experimental bignum primitives (and maybe more)
+# Finite Fields
+Experimental finite fields primitives (and maybe more)
 
-For now this repo stores experiments to write a fast bigint library.
+For now this repo stores experiments to write a fast bigint, crypto and finite fields library (or libraries).
 Unfortunately this is an aree where the GCC and Clang are (used to be?) seriously lacking in terms of codegen and intrinsics (but not MSVC and ICC for some reasons).
 
 For example besides using the int128 types as clutches:
