@@ -81,13 +81,29 @@ func ccopy*[T](ctl: T, x: var T, y: T) {.inline.}=
 # ###############################################################################
 # Primitives
 
+# GCC is really bad at handling those intrinsics the code is awful
+# while Clang code is ideal.
 func addcarry_u64(carryIn: Carry, a, b: uint64, sum: var uint64): Carry {.importc: "_addcarry_u64", header:"<x86intrin.h>", nodecl.}
 func subborrow_u64(borrowIn: Borrow, a, b: uint64, diff: var uint64): Borrow {.importc: "_subborrow_u64", header:"<x86intrin.h>", nodecl.}
 
 type
   uint128*{.importc: "unsigned __int128".} = object
 
-func muladd1*(hi, lo: var uint64, a, b, c: uint64) {.inline.}=
+func subborrow_u64(a, b: uint64, hi: var uint64): uint64 {.importc: "_mulx_u64", header:"<x86intrin.h>", nodecl.}
+
+func umul128(a, b: uint64, hi: var uint64): uint64 {.inline.} =
+  var dblPrec {.noInit.}: uint128
+  {.emit:[dblPrec, " = (unsigned __int128)", a," * (unsigned __int128)", b, ";"].}
+
+  # Don't forget to dereference the var param in C mode
+  when defined(cpp):
+    {.emit:[hi, " = (NU64)(", dblPrec," >> ", 64'u64, ");"].}
+    {.emit:[result, " = (NU64)", dblPrec,";"].}
+  else:
+    {.emit:["*",hi, " = (NU64)(", dblPrec," >> ", 64'u64, ");"].}
+    {.emit:[result, " = (NU64)", dblPrec,";"].}
+
+func muladd1(hi, lo: var uint64, a, b, c: uint64) {.inline.}=
   ## Extended precision multiplication + addition
   ## This is constant-time on most hardware except some specific one like Cortex M0
   ## (hi, lo) <- a*b + c
@@ -107,7 +123,7 @@ func muladd1*(hi, lo: var uint64, a, b, c: uint64) {.inline.}=
       {.emit:["*",hi, " = (NU64)(", dblPrec," >> ", 64'u64, ");"].}
       {.emit:["*",lo, " = (NU64)", dblPrec,";"].}
 
-func muladd2*(hi, lo: var uint64, a, b, c1, c2: uint64) {.inline.}=
+func muladd2(hi, lo: var uint64, a, b, c1, c2: uint64) {.inline.}=
   ## Extended precision multiplication + addition + addition
   ## This is constant-time on most hardware except some specific one like Cortex M0
   ## (hi, lo) <- a*b + c
@@ -246,7 +262,7 @@ func montyMul_SOS(r: var BigIntCarry, a, b, modulus: BigIntCarry, m0inv: uint64)
   # Conditional substraction
 
 # ###############################################################################
-# Unrolled
+# Unrolled - CIOS no carry
 
 proc replaceNodes(ast: NimNode, what: NimNode, by: NimNode): NimNode =
   # Replace "what" ident node by "by"
@@ -296,6 +312,159 @@ func montyMul_CIOS_nocarry_unrolled(r: var BigIntCarry, a, b, modulus: BigIntCar
 
   # Conditional substraction
   r = t
+
+# ###############################################################################
+# Unrolled - via mulNx64
+# - Intel MULX/ADCX/ADOX Table 2 p13: https://www.intel.cn/content/dam/www/public/us/en/documents/white-papers/ia-large-integer-arithmetic-paper.pdf
+# - https://eprint.iacr.org/eprint-bin/getfile.pl?entry=2017/558&version=20170608:200345&file=558.pdf
+# - https://github.com/intel/ipp-crypto
+# - https://github.com/herumi/mcl
+#
+# Stashed for now
+# Even though the performance gains expected are remarkable (15~20%):
+# - no compiler supports this with intrinsics, GCC doesn't even properly generate add with carry
+#   so ADCX/ADOX are very unlikely for the next 30 years
+# - inline assembly would be tedious to generate and maintain as we deal with flags
+# - AMD CPUs doesn't even support MULX/ADOX/ADCX
+# - Other architectures don't support it as well, and some (MIPS) don't even have carry flags.
+#   meaning a fallback would be needed.
+#
+# That said, given the computational constraint of zero-knowledge proofs
+# i.e. machines with dozens of cores running for minutes
+# and the potential of zk-rollups, winning 10~20% via pure Assembly is probably desirable
+#
+# Formally verifying and/or auditing it would be very unpleasant though.
+
+proc mulAcc_Nby1_init(accums: seq[NimNode], a, b: NimNode): NimNode =
+  ## Multiply-Accumulate with accums initialization
+  ## accums[1 ..< N+1] <- a[0 ..< N] * b
+
+  # I didn't choose the horrible parameter order of addcarry and umul128/mulx ...
+  result = newStmtList()
+
+  let N = accums.len - 2
+
+  # Register that will be used in alternance to maintain 2 pipelines
+  var t0 = genSym(nskVar, "t0_")
+  var t1 = genSym(nskVar, "t1_")
+
+  let acc0 = accums[0]
+  let carry = genSym(nskVar, "carry_Nby1_")
+  result.add quote do:
+    `t0` = umul128(`a`[0], `b`, `acc0`)
+    var `carry`: Carry
+  for i in 1 ..< N:
+    # accums[i] <- a[i] * b + t with t being the overflow from accums[i-1]
+    let ai = nnkBracketExpr.newTree(a, newLit i)
+    let acci = accums[i]
+    result.add quote do:
+      # Here we want mulx ideally so that umul128 doesn't
+      # interrupt the carrychain
+      `t1` = umul128(`ai`, `b`, `acci`)
+      `carry` = addcarry_u64(`carry`, `acci`, `t0`, `acci`)
+    swap(t0, t1) # Alternate pipelines
+  # Set accums[N] <- carry from [0..<N]
+  let last = if (N and 1) == 0: t0
+              else: t1
+  let accN = accums[N]
+  result.add quote do:
+    discard addcarry_u64(`carry`, 0, `last`, `accN`)
+
+proc mulAcc_Nby1(accums: seq[NimNode], a, b: NimNode): NimNode =
+  ## Multiply-Accumulate
+  ## accums[1 ..< N+2] <- accums[1 ..< N+1] + a[0 ..< N] * b
+  # This ideally requires 2 carry-chains and a multiplication that doesn't break it
+  let N = accums.len - 2
+  let t = genSym(nskVar, "t_")
+  let c0 = genSym(nskVar, "carry0_")
+  let c1 = genSym(nskVar, "carry1_")
+  result = newStmtList()
+
+  result.add quote do:
+    var
+      `t` = 0
+      `c0` = Carry(0)
+      `c1` = Carry(0)
+
+  let accNp1 = accums[N+1]
+  for i in 0 ..< N:
+    let ai = nnkBracketExpr.newTree(a, newLit i)
+    let acci = accums[i]
+    let accip1 = accums[i+1]
+
+    result.add quote do:
+      # (accums[N+1], t) <- a[i] * b
+      `t` = umul128(`ai`, `b`, `accNp1`)
+      # (c0, accums[i]) <- accums[i] + t + c0
+      `c0` = addcarry_u64(`c0`, `acci`, `t`, `acci`)
+      # (c1, accums[i+1]) <- accums[i+1] + accums[N+1] + c1
+      `c1` = addcarry_u64(`c1`, `accip1`, `accNp1`, `accip1`)
+
+  let accN = accums[N]
+  result.add quote do:
+    `c0` = addcarry_u64(`c0`, `accN`, 0, `accN`)
+    discard addcarry_u64(`c1`, `accNp1`, 0, `accNp1`)
+    discard addcarry_u64(`c0`, `accNp1`, 0, `accNp1`)
+
+  result = nnkBlockStmt.newTree(
+    genSym(nskLabel, "mulAcc_Nby1_"),
+    result
+  )
+
+proc montyMul_Nby1(
+       accums: seq[NimNode],
+       a, b, p: NimNode,
+       p0i: NimNode,
+       init: bool): NimNode =
+  ## Generate the AST to multiply
+  ## the bigint ``a`` array[N, Word]
+  ## by a single word ``b``
+  ##
+  ## ``accums`` are the target accumulators
+  ## of size N+2, with 2 carry words in "N+1" and "N+2" position
+  ## and accums[0] will be the least-significant accumulator
+  ##
+  ## ``a`` is a BigInt of size N-word
+  ## ``b`` is a word
+  ## ``p`` is the prime field modulus
+  ## ``p0i`` is the Montgomery magic constant -1/m[0] mod R with R = 2^64
+  ##
+  ## `t0`, `t1` are scratchspace variables
+  ##
+  ## This computes MonPro(a, b[i]) = a b[i] R^-1 mod p
+
+  # if ``init``, accums are considered not initialized
+  # and content will be overwritten, otherwise it is accumulated.
+  #
+  # Algorithm:
+  #
+  # 1. init:
+  #      accums[1 ..< N+1] = a[0 ..< N] * b
+  #    otherwise:
+  #      accums[1 ..< N+1] += a[0 ..< N] * b (potential carry in N+2 unless we use the same technique as in Goff?)
+  # 2. m <- accums[0] * p0i
+  # 3. accums[1 ..< N+2] <- accums[1 ..< N+1] + p[0 ..< N] * m
+  #
+  # Using compile-time nodes instead of runtime arrays
+  # should give the compiler more leeway on register allocation,
+  # analyses and optimizing away unused code.
+  # This should in particular help for pipelining instructions like MULX, ADCX, ADOX
+
+  let N = accums.len - 2
+  result = newStmtList()
+
+  if init:
+    # accums[1 ..< N+1] <- a[0..<N] * b
+    result.add mulAcc_Nby1_init(accums, a, b)
+  else:
+    # accums[1 ..< N+2] <- accums[1 ..< N+1] + a[0..<N] * b
+    result.add mulAcc_Nby1(accums, a, b)
+
+  let acc0 = accums[0]
+  let `m` = genSym(nskLet, "m_")
+  result.add quote do:
+    let `m` = `acc0` * `p0i`
+  result.add mulAcc_Nby1(accums, p, m)
 
 # ###############################################################################
 import random, times, std/monotimes, strformat
