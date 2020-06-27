@@ -1,4 +1,7 @@
-import macros
+import macros, strutils
+
+# The v1 has issues with the difference in
+# access with offset between GCC and Clang
 
 func wordsRequired(bits: int): int {.compileTime.} =
   ## Compute the number of limbs required
@@ -13,51 +16,54 @@ type
     limbs: array[bits.wordsRequired, uint64]
 
 macro addCarryGen_u64(a, b: untyped, bits: static int): untyped =
-  var asmStmt = (block:
-    "      movq %[b], %[tmp]\n" &
-    "      addq %[tmp], %[a]\n"
-  )
 
-  let maxByteOffset = bits div 8
-  const wsize = sizeof(uint64)
-
-  when defined(gcc):
-    for byteOffset in countup(wsize, maxByteOffset-1, wsize):
-      asmStmt.add (block:
-        "\n" &
-        # movq 8+%[b], %[tmp]
-        "      movq " & $byteOffset & "+%[b], %[tmp]\n" &
-        # adcq %[tmp], 8+%[a]
-        "      adcq %[tmp], " & $byteOffset & "+%[a]\n"
-      )
-  elif defined(clang):
-    # https://lists.llvm.org/pipermail/llvm-dev/2017-August/116202.html
-    for byteOffset in countup(wsize, maxByteOffset-1, wsize):
-      asmStmt.add (block:
-        "\n" &
-        # movq 8+%[b], %[tmp]
-        "      movq " & $byteOffset & "%[b], %[tmp]\n" &
-        # adcq %[tmp], 8+%[a]
-        "      adcq %[tmp], " & $byteOffset & "%[a]\n"
-      )
-
-  let tmp = ident("tmp")
-  asmStmt.add (block:
-    ": [tmp] \"+r\" (`" & $tmp & "`), [a] \"+m\" (`" & $a & "->limbs[0]`)\n" &
-    ": [b] \"m\"(`" & $b & "->limbs[0]`)\n" &
-    ": \"cc\""
-  )
+  let L = bits.wordsRequired
 
   result = newStmtList()
+
+  # It is very important that the update destination
+  # is in registers for add with carry
+  # On Skylake-X (whichIntel has been stuck with for the past 4 years)
+  #
+  # ADC reg <- reg, is 1 µops fused, 1 µops unfused, Latency 1
+  # ADC reg <- mem, is 1 µops fused, 2 µops unfused, Latency 1
+  # ADC mem <- reg, is 4 µops fused, 6 µops unfused, Latency 5
+
+  let tmp = ident("tmp")
   result.add quote do:
-    var `tmp`{.noinit.}: uint64
+    var `tmp` = `a`
+
+  var
+    asmStmt: string
+    outOperands: seq[string]
+    inOperands: seq[string]
+
+  for word in 0 ..< L:
+    asmStmt.add '\n'
+    let tmpW = "[tmp" & $word & "]"
+    let bW = "[b" & $word & "]"
+
+    if word == 0:
+      asmStmt.add "      addq %" & bW & ", %" & tmpW & "\n"
+    else:
+      asmStmt.add "      adcq %" & bW & ", %" & tmpW & "\n"
+
+    outOperands.add tmpW & " \"+r\" (`tmp.limbs[" & $word & "]`)"
+    inOperands.add bW & " \"m\" (`b->limbs[" & $word & "]`)"
+
+  asmStmt.add ": " & outOperands.join(", ") & '\n'
+  asmStmt.add ": " & inOperands.join(", ") & '\n'
+  asmStmt.add ": \"cc\"" # Polluted Carry, Overflow, Zero flags (at least)
 
   result.add nnkAsmStmt.newTree(
     newEmptyNode(),
     newLit asmStmt
   )
 
-  echo result.toStrLit
+  result.add quote do:
+    `a` = `tmp`
+
+  # echo result.toStrLit
 
 func `+=`(a: var BigInt, b: BigInt) {.noinline.}=
   # Depending on inline or noinline
