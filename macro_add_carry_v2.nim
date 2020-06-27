@@ -65,10 +65,7 @@ macro addCarryGen_u64(a, b: untyped, bits: static int): untyped =
 
   # echo result.toStrLit
 
-func `+=`(a: var BigInt, b: BigInt) {.noinline.}=
-  # Depending on inline or noinline
-  # the generated ASM addressing must be tweaked for Clang
-  # https://lists.llvm.org/pipermail/llvm-dev/2017-August/116202.html
+func `+=`(a: var BigInt, b: BigInt) {.inline.}=
   addCarryGen_u64(a, b, BigInt.bits)
 
 # #############################################
