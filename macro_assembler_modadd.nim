@@ -13,17 +13,20 @@ macro genModAdd[N: static int](
 
   var ctx: Assembler_x86
   var
-    arrA = init(OperandArray, $(a[0][0]), N, Memory, InputOutput)
-    arrB = init(OperandArray, $(b[0]), N, AnyRegOrMem, Input)
-    arrM = init(OperandArray, $(modulus[0]), N, AnyRegOrMem, Input)
+    arrA = init(OperandArray, nimSymbol = a, N, Memory, Output_Overwrite)
+    arrB = init(OperandArray, nimSymbol = b, N, Memory, Input)
+    arrM = init(OperandArray, nimSymbol = modulus, N, Memory, Input)
 
-    arrT = init(OperandArray, "t", N, Register, InputOutput)
-    arrTsub = init(OperandArray, "tsub", N, Register, InputOutput)
+    arrT = init(OperandArray, nimSymbol = ident"t", N, Register, InputOutput)
+    arrTsub = init(OperandArray, nimSymbol = ident"tsub", N, Register, Output_Overwrite)
     overflowed = Operand(
-      id: "[overflowed]",
-      rm: Register,
-      constraint: Output_Overwrite,
-      param: "overflowed"
+      desc: OperandDesc(
+        asmId: "[overflowed]",
+        nimSymbol: ident"overflowed",
+        rm: Register,
+        constraint: Output_Overwrite,
+        cEmit: "overflowed"
+      )
     )
 
   # Addition
@@ -59,17 +62,26 @@ macro genModAdd[N: static int](
     ctx.cmovc arrT[i], arrTsub[i]
     ctx.mov arrA[i], arrT[i]
 
-  let t = ident(arrT.name)
-  let tsub = ident(arrTsub.name)
-  let ov = ident(overflowed.param)
+  let t = arrT.nimSymbol
+  let tsub = arrTsub.nimSymbol
+  let ov = overflowed.desc.nimSymbol
   result.add quote do:
     var `t` = `a`
     var `tsub` {.noInit.}: typeof(`a`)
     var `ov` {.noInit, exportc.}: uint64
   result.add ctx.generate
 
-func addmod_macro*(a: var BigIntCarry, b: BigIntCarry, modulus: BigIntCarry){.inline.} =
+func addmod_macro[N: static int](a: var array[N, uint64], b, modulus: array[N, uint64]){.inline.} =
+  # Indirection to avoid a codegen bug (Nim setting type of a.limbs as BigInt instead of array)
   genModAdd(
+    a,
+    b,
+    modulus
+  )
+
+
+func addmod_macro*(a: var BigIntCarry, b, modulus: BigIntCarry){.inline.} =
+  addmod_macro(
     a.limbs,
     b.limbs,
     modulus.limbs

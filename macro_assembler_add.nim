@@ -23,24 +23,28 @@ macro mpAdd[N: static int](a: var array[N, Word], b: array[N, Word]): untyped =
 
   var ctx: Assembler_x86
   var
-    arrT = init(OperandArray, "t", N, Register, InputOutput)
-    arrB = init(OperandArray, $(b[0]), N, AnyRegOrMem, Input)
+    arrT = init(OperandArray, nimSymbol = ident"t", N, Register, InputOutput)
+    arrB = init(OperandArray, nimSymbol = b, N, Memory, Input)
+    arrA = init(OperandArray, nimSymbol = a, N, Memory, Output_Overwrite)
 
   for i in 0 ..< N:
     if i == 0:
       ctx.add arrT[0], arrB[0]
     else:
       ctx.adc arrT[i], arrB[i]
+    ctx.mov arrA[i], arrT[i]
 
-  let tmp = ident(arrT.name)
+  let tmp = ident(arrT.nimSymbol)
   result.add quote do:
-    var `tmp` = `a`
+    var `tmp` {.exportc, noInit.} = `a`
   result.add ctx.generate()
-  result.add quote do:
-    `a` = `tmp`
+
+func `+=`[N: static int](a: var array[N, Word], b: array[N, Word]) {.inline.}=
+  # Indirection necessary to avoid bad codegen
+  mpAdd(a, b)
 
 func `+=`(a: var BigInt, b: BigInt) {.inline.}=
-  mpAdd(a.limbs, b.limbs)
+  a.limbs += b.limbs
 
 # #############################################
 import random
