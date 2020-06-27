@@ -1,7 +1,7 @@
 # Constant-time modular arithmetic with carry test
 # Compile with Clang, GCC is really bad
 
-import modular_add_common, modular_add_asm
+import modular_add_common, modular_add_asm, macro_assembler_modadd
 
 # ###############################################################################
 # Constant time conditional move
@@ -240,6 +240,17 @@ proc main(bitSize: static int) =
       let stopClk = getTicks()
       let stop = getMonotime()
       report("AddMod-Carry ASM", bitsize, "Full Inline ASM", start, stop, startClk, stopClk, Iters)
+
+    block: # comment this out for clang
+      var a1 = a
+      let start = getMonotime()
+      let startClk = getTicks()
+      for _ in 0 ..< Iters:
+        a1.addmod_macro(b, M)
+      let stopClk = getTicks()
+      let stop = getMonotime()
+      report("AddMod-Carry Macro", bitsize, "Macro Assembler", start, stop, startClk, stopClk, Iters)
+
 
 main(254)
 main(381)
