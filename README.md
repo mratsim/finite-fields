@@ -1,4 +1,9 @@
 # Finite Fields
+
+_This has been implemented in Constantine in PR https://github.com/mratsim/constantine/pull/69_
+
+---------------------------------------------------------
+
 Experimental finite fields primitives (and maybe more)
 
 For now this repo stores experiments to write a fast bigint, crypto and finite fields library (or libraries).
